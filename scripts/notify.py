@@ -171,17 +171,29 @@ async def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def _report_failure(text: str) -> None:
+    """Send a short error notice to Telegram (never include secrets)."""
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if flag("DRY_RUN") or not token or not chat:
+        return
     try:
-        sys.exit(asyncio.run(main()))
-    except BaseException as exc:  # noqa: BLE001
-        if not flag("DRY_RUN") and os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"):
-            try:
-                tg_send(
-                    os.environ["TELEGRAM_BOT_TOKEN"],
-                    os.environ["TELEGRAM_CHAT_ID"],
-                    f"⚠️ dtek-notify: {type(exc).__name__}: {str(exc)[:300]}",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        tg_send(token, chat, f"⚠️ dtek-notify: {text[:300]}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def run() -> int:
+    try:
+        return asyncio.run(main())
+    except SystemExit as exc:
+        # SystemExit(0)/None is a normal exit; only real failures are reported.
+        if exc.code not in (0, None):
+            _report_failure(str(exc.code))
         raise
+    except Exception as exc:  # noqa: BLE001
+        _report_failure(f"{type(exc).__name__}: {exc}")
+        raise
+
+
+if __name__ == "__main__":
+    sys.exit(run())
