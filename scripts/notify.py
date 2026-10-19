@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import logging
 import os
 import re
 import sys
+import time
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -148,7 +151,38 @@ async def make_client(site: str) -> Any:
     return DtekClient(site, ajax_url=f"{base_url}/ua/ajax", session=session)
 
 
-def build_message(resp: HomeNumResponse, city: str, street: str, house: str) -> str:
+# ── State (change detection) ──────────────────────────────────────────────────
+# The state file holds only schedule text and the last error notice — no secrets,
+# no address. In GitHub Actions it is persisted between runs with actions/cache.
+STATE_FILE = Path(os.environ.get("STATE_FILE", ".state/last.json"))
+ERROR_COOLDOWN_SEC = 6 * 3600  # repeat the same error notice at most every 6 hours
+
+
+def load_state() -> dict[str, Any]:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state: dict[str, Any]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def schedule_changed(old: dict[str, str], new: dict[str, str]) -> bool:
+    """True if any currently published day is new or differs from the stored one.
+
+    Days that merely disappeared (yesterday after midnight) do not count as a change.
+    """
+    return any(old.get(key) != value for key, value in new.items())
+
+
+def build_message(
+    resp: HomeNumResponse, city: str, street: str, house: str
+) -> tuple[str, dict[str, str]]:
+    """Return (message_text, signature). The signature has no timestamps in it."""
     entry = resp.houses.get(house)
     if entry is None:
         raise RuntimeError(
@@ -158,9 +192,14 @@ def build_message(resp: HomeNumResponse, city: str, street: str, house: str) -> 
     head = [f"<b>Графік відключень</b> ({now})", f"{city}, {street}, {house}"]
 
     if entry.is_excluded:
-        return "\n".join(head + ["Адреса не входить до графіків відключень."])
+        body = "Адреса не входить до графіків відключень."
+        return "\n".join(head + [body]), {"_status": body}
     if entry.is_multi_group:
-        return "\n".join(head + [f"Складна схема підключення, групи: {', '.join(entry.group_ids)}. Точний прогноз неможливий."])
+        body = (
+            f"Складна схема підключення, групи: {', '.join(entry.group_ids)}. "
+            "Точний прогноз неможливий."
+        )
+        return "\n".join(head + [body]), {"_status": body}
 
     group = entry.primary_group or "?"
     names = resp.preset.sch_names if resp.preset else {}
@@ -169,21 +208,43 @@ def build_message(resp: HomeNumResponse, city: str, street: str, house: str) -> 
         head.append(f"Оновлено ДТЕК: {resp.update_timestamp}")
 
     labels = resp.preset.time_zone if resp.preset else {}
-    parts = head
     if resp.fact is None:
-        parts.append("\nФактичний графік не опубліковано.")
-        return "\n".join(parts)
+        return "\n".join(head + ["\nФактичний графік не опубліковано."]), {"_status": "no-fact"}
 
-    today = resp.fact.get_group_today(group)
-    tomorrow = resp.fact.get_group_day(resp.fact.today_ts + 86400, group)
-    parts.append("\n<b>Сьогодні:</b>\n" + (format_slots(today, labels) if today else "не опубліковано"))
-    parts.append("\n<b>Завтра:</b>\n" + (format_slots(tomorrow, labels) if tomorrow else "ще не опубліковано"))
-    return "\n".join(parts)
+    today_ts = resp.fact.today_ts
+    sig: dict[str, str] = {"_group": group}
+    sections: list[str] = []
+    have_tomorrow = False
+    for ts_str in sorted(resp.fact.days, key=int):
+        slots = resp.fact.days[ts_str].get(group)
+        if not slots:
+            continue
+        ts = int(ts_str)
+        date = datetime.datetime.fromtimestamp(ts, KYIV).date()
+        if ts == today_ts:
+            name = "Сьогодні"
+        elif ts == today_ts + 86400:
+            name, have_tomorrow = "Завтра", True
+        else:
+            name = "Графік"
+        text = format_slots(slots, labels)
+        sections.append(f"\n<b>{name}</b> ({date:%d.%m}):\n{text}")
+        sig[date.isoformat()] = text
+    if not have_tomorrow:
+        sections.append("\n<b>Завтра:</b>\nще не опубліковано")
+    if len(sig) == 1:
+        sig["_status"] = "empty"
+    return "\n".join(head + sections), sig
 
 
 async def main() -> int:
     logging.basicConfig(level=logging.DEBUG if flag("DTEK_DEBUG") else logging.INFO)
-    site, city, street, house = env("DTEK_SITE"), env("DTEK_CITY"), env("DTEK_STREET"), env("DTEK_HOUSE")
+    site, city, street, house = (
+        env("DTEK_SITE"),
+        env("DTEK_CITY"),
+        env("DTEK_STREET"),
+        env("DTEK_HOUSE"),
+    )
     dry_run = flag("DRY_RUN")
 
     client = await make_client(site)
@@ -197,21 +258,44 @@ async def main() -> int:
         if resp.preset:
             print("time_zone sample:", dict(list(resp.preset.time_zone.items())[:4]))
 
-    text = build_message(resp, city, street, house)
+    text, sig = build_message(resp, city, street, house)
+    state = load_state()
+    old_sig = state.get("sig") or {}
+    needs_send = flag("FORCE_SEND") or not old_sig or schedule_changed(old_sig, sig)
+
     if dry_run:
         print(text)
-    else:
-        tg_send(env("TELEGRAM_BOT_TOKEN"), env("TELEGRAM_CHAT_ID"), text)
+        print(f"[dry-run] would send: {needs_send} (state untouched)")
+        return 0
+
+    if not needs_send:
+        print("No changes in the schedule - nothing to send.")
+        if state.pop("error", None) is not None:
+            save_state(state)
+        return 0
+
+    tg_send(env("TELEGRAM_BOT_TOKEN"), env("TELEGRAM_CHAT_ID"), text)
+    state["sig"] = sig
+    state.pop("error", None)
+    save_state(state)  # saved only after a successful send
+    print("Message sent.")
     return 0
 
 
 def _report_failure(text: str) -> None:
-    """Send a short error notice to Telegram (never include secrets)."""
+    """Send a short error notice (at most once per cooldown for the same error)."""
     token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if flag("DRY_RUN") or not token or not chat:
         return
+    text = text[:300]
+    state = load_state()
+    last = state.get("error") or {}
+    if last.get("text") == text and time.time() - float(last.get("ts", 0)) < ERROR_COOLDOWN_SEC:
+        return
     try:
-        tg_send(token, chat, f"⚠️ dtek-notify: {text[:300]}")
+        tg_send(token, chat, f"⚠️ dtek-notify: {text}")
+        state["error"] = {"text": text, "ts": time.time()}
+        save_state(state)
     except Exception:  # noqa: BLE001
         pass
 
