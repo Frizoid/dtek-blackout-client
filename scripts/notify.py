@@ -9,6 +9,7 @@ import asyncio
 import datetime
 import logging
 import os
+import re
 import sys
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -49,13 +50,46 @@ def _slot_sort_key(key: str) -> tuple[int, str]:
     return (int(key) if key.isdigit() else 10**6, key)
 
 
-def format_slots(slots: dict[str, SlotStatus], labels: dict[str, str]) -> str:
-    """Merge consecutive slots with the same status into time ranges.
+_TIME_RE = re.compile(r"^\s*(\d{1,2})(?:[:.](\d{2}))?\s*$")
 
-    Labels like "00:00–00:30" come from preset.time_zone (real site data).
+
+def _to_minutes(part: str) -> int | None:
+    m = _TIME_RE.match(part)
+    if not m:
+        return None
+    return int(m.group(1)) * 60 + int(m.group(2) or 0)
+
+
+def _slot_bounds(key: str, labels: dict[str, str], total: int) -> tuple[int, int]:
+    """Return (start, end) in minutes for a slot.
+
+    Real labels are like "00-01" (hourly sites) or "00:00–00:30" (30-min slots).
+    Falls back to key arithmetic when the label cannot be parsed.
     """
-    icons = {"outage": "🔴", "maybe": "🟡"}
-    runs: list[list[Any]] = []  # [kind, first_key, last_key]
+    label = labels.get(key, "")
+    parts = re.split(r"\s*[–—-]\s*", label, maxsplit=1)
+    if len(parts) == 2:
+        start, end = _to_minutes(parts[0]), _to_minutes(parts[1])
+        if start is not None and end is not None:
+            if end <= start:  # e.g. "23-00"
+                end += 24 * 60
+            return start, end
+    size = 30 if total > 24 else 60
+    idx = int(key) - 1 if key.isdigit() else 0
+    return idx * size, (idx + 1) * size
+
+
+def _fmt(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def format_slots(slots: dict[str, SlotStatus], labels: dict[str, str]) -> str:
+    """Convert slot statuses into merged time ranges (🔴 outage, 🟡 possible).
+
+    FIRST/MFIRST = first half of the slot, SECOND/MSECOND = second half.
+    """
+    intervals: list[tuple[str, int, int]] = []
+    total = len(slots)
     for key in sorted(slots, key=_slot_sort_key):
         st = slots[key]
         if st.has_outage:
@@ -63,28 +97,28 @@ def format_slots(slots: dict[str, SlotStatus], labels: dict[str, str]) -> str:
         elif st.may_have_outage:
             kind = "maybe"
         else:
-            kind = None
-        if kind is None:
             continue
-        if runs and runs[-1][0] == kind and _slot_sort_key(key)[0] == _slot_sort_key(runs[-1][2])[0] + 1:
-            runs[-1][2] = key
+        start, end = _slot_bounds(key, labels, total)
+        mid = (start + end) // 2
+        if st in (SlotStatus.FIRST, SlotStatus.MFIRST):
+            end = mid
+        elif st in (SlotStatus.SECOND, SlotStatus.MSECOND):
+            start = mid
+        intervals.append((kind, start, end))
+
+    merged: list[list[Any]] = []
+    for kind, start, end in sorted(intervals, key=lambda x: (x[1], x[2])):
+        if merged and merged[-1][0] == kind and start <= merged[-1][2]:
+            merged[-1][2] = max(merged[-1][2], end)
         else:
-            runs.append([kind, key, key])
-    if not runs:
+            merged.append([kind, start, end])
+    if not merged:
         return "Відключень не заплановано ✅"
-
-    def start(k: str) -> str:
-        return labels.get(k, k).split("–")[0]
-
-    def end(k: str) -> str:
-        parts = labels.get(k, k).split("–")
-        return parts[-1]
-
-    lines = []
-    for kind, a, b in runs:
-        suffix = " (можливо)" if kind == "maybe" else ""
-        lines.append(f"{icons[kind]} {start(a)}–{end(b)}{suffix}")
-    return "\n".join(lines)
+    icons = {"outage": "🔴", "maybe": "🟡"}
+    return "\n".join(
+        f"{icons[k]} {_fmt(a)}–{_fmt(b)}" + (" (можливо)" if k == "maybe" else "")
+        for k, a, b in merged
+    )
 
 
 async def make_client(site: str) -> Any:
