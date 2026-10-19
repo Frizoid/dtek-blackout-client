@@ -1,0 +1,68 @@
+name: dtek-notify
+
+on:
+  schedule:
+    - cron: "0 5,15 * * *"   # 05:00 и 15:00 UTC (08:00/18:00 по Киеву летом, 07:00/17:00 зимой)
+  workflow_dispatch:
+    inputs:
+      stub:
+        description: "Заглушка StubDtekClient (без запросов к DTEK; для адреса м. Українка / вул. Юності / 1)"
+        type: boolean
+        default: false
+      show_browser:
+        description: "Chromium не headless (через xvfb)"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Не отправлять в Telegram, печатать текст в лог"
+        type: boolean
+        default: false
+      debug:
+        description: "Подробный лог"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dtek-notify
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+          playwright install --with-deps chromium
+
+      - name: Run
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DTEK_SITE: ${{ secrets.DTEK_SITE }}
+          DTEK_CITY: ${{ secrets.DTEK_CITY }}
+          DTEK_STREET: ${{ secrets.DTEK_STREET }}
+          DTEK_HOUSE: ${{ secrets.DTEK_HOUSE }}
+          DTEK_STUB: ${{ inputs.stub && '1' || '0' }}
+          DTEK_SHOW_BROWSER: ${{ inputs.show_browser && '1' || '0' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          DTEK_DEBUG: ${{ inputs.debug && '1' || '0' }}
+        run: |
+          if [ "$DTEK_SHOW_BROWSER" = "1" ]; then
+            xvfb-run -a python scripts/notify.py
+          else
+            python scripts/notify.py
+          fi
