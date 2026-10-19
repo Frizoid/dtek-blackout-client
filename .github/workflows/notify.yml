@@ -2,7 +2,7 @@ name: dtek-notify
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # каждые 30 минут (UTC); GitHub может задерживать запуски
+    - cron: "11,41 * * * *"     # Runs at 11 and 41 minutes past the hour
   workflow_dispatch:
     inputs:
       stub:
